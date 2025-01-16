@@ -1617,6 +1617,11 @@ impl<'a> Executor<'a> {
                 let a = self.state.pc + 4;
                 self.rw_cpu(rd, a);
                 let next_pc = b.wrapping_add(c);
+
+                if self.unconstrained {
+                    println!("unconstrained jalr to {:x}", next_pc);
+                }
+
                 (a, b, c, next_pc)
             }
             _ => unreachable!(),
