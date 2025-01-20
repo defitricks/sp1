@@ -52,10 +52,15 @@ goblin = { version = "0.9", optional = true }
 rustc-demangle = { version = "0.1.18", optional = true }
 gecko_profile = { version = "0.4.0", optional = true }
 indicatif = { version = "0.17.8", optional = true }
+cranelift = "0.115.1"
+cranelift-jit = "0.115.1"
+cranelift-module = "0.115.1"
+cranelift-native = "0.115.1"
 
 [dev-dependencies]
 sp1-zkvm = { workspace = true, features = ["lib"] }
 test-artifacts = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 bigint-rug = ["sp1-curves/bigint-rug"]

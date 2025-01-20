@@ -30,6 +30,7 @@ mod executor;
 mod hook;
 mod instruction;
 mod io;
+mod jit;
 mod memory;
 mod opcode;
 #[cfg(feature = "profiling")]
