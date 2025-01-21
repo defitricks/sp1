@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cranelift::{
     codegen::{
         self,
-        ir::{Block, InstBuilder, Type, Value},
+        ir::{Block, FuncRef, Function, InstBuilder, Type, Value},
         settings::{self, Configurable},
         CodegenError,
     },
@@ -23,6 +23,7 @@ use crate::{
 mod block;
 use block::{BlockBuilder, BuilderResult, JITBlock};
 mod builtin;
+use builtin::Builtin;
 
 #[cfg(test)]
 mod test;
@@ -42,6 +43,9 @@ pub struct Engine {
     pub(crate) function_ctx: frontend::FunctionBuilderContext,
     // The JIT module
     pub(crate) jit_module: JITModule,
+
+    #[cfg(test)]
+    pub(crate) insert_exit: bool,
 }
 
 impl Engine {
@@ -65,20 +69,41 @@ impl Engine {
             ctx: jit_module.make_context(),
             function_ctx: frontend::FunctionBuilderContext::new(),
             jit_module,
+            #[cfg(test)]
+            insert_exit: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn add_exit(&mut self) {
+        self.insert_exit = true;
     }
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct VmContext {
     // A ptr to the registers
     registers: *mut u32,
+    // The original memory of the executor
+    host_memory: *mut Memory<MemoryRecord>,
     // The ephemeral memory of the executor
     ephemeral_mem: *mut Memory<MemoryRecord>,
     // The target pc of the jump
     pc: u32,
     // 1 if were exiting unconstrained mode.
     exit: u32,
+}
+
+impl VmContext {
+    fn new(
+        registers: *mut u32,
+        host_memory: *mut Memory<MemoryRecord>,
+        ephemeral_mem: *mut Memory<MemoryRecord>,
+        pc: u32,
+    ) -> Self {
+        Self { registers, host_memory, ephemeral_mem, pc, exit: 0 }
+    }
 }
 
 impl Engine {
@@ -88,39 +113,36 @@ impl Engine {
     ///
     /// Note: Its up to the caller to ensure that we should be using the "unconstrained" JIT Engine.
     pub fn run(&mut self, executor: &mut Executor<'_>) {
-        // Todo: can we do this better?
-        let mut ephemeral_mem = executor.state.memory.clone();
+        let host_memory = &mut executor.state.memory as *mut Memory<MemoryRecord>;
+
+        let mut ephemeral_mem = Memory::new_preallocated();
+        let eph = &mut ephemeral_mem as *mut Memory<MemoryRecord>;
 
         // Cloning the registers is cheap.
         let mut registers = executor.registers();
 
-        let mut pc = executor.state.pc + 4;
-        let mut exit = 0;
+        let mut context =
+            VmContext::new(registers.as_mut_ptr(), host_memory, eph, executor.state.pc);
 
         // Start executing the program
         // Our current JIT strategy only compiles up until the next `JALR` instruction.
         loop {
-            if let Some(entry_point) = self.entry_points.get(&pc) {
+            if let Some(entry_point) = self.entry_points.get(&context.pc) {
                 unsafe {
-                    entry_point.call(
-                        registers.as_mut_ptr(),
-                        &mut ephemeral_mem,
-                        &mut pc,
-                        &mut exit,
-                    );
+                    entry_point.call(&mut context);
                 }
 
                 // We are exiting unconstrained mode.
-                if exit == 1 {
+                if context.exit == 1 {
                     // This is either triggered by a `JALR` or `EXIT_UNCONSTRAINED`
-                    executor.state.pc = pc;
+                    executor.state.pc = context.pc;
                     break;
                 }
 
                 // If we havent exited, then were handling a JALR.
-                debug_assert!(pc != 0);
+                debug_assert!(context.pc != 0);
             } else {
-                self.compile_and_link(&executor.program, pc).expect("failed to compile");
+                self.compile_and_link(&executor.program, context.pc).expect("failed to compile");
                 continue;
             }
         }
@@ -170,26 +192,15 @@ impl Engine {
         // Clear any existing function
         self.ctx.func.clear();
 
-        // Our host native pointer type, used for context.
+        // The host ptr type.
         let ptr_type = self.jit_module.target_config().pointer_type();
 
-        // Registers
-        self.ctx.func.signature.params.push(AbiParam::new(ptr_type));
-
-        // Memory
-        self.ctx.func.signature.params.push(AbiParam::new(ptr_type));
-
-        // Pc
-        self.ctx.func.signature.params.push(AbiParam::new(ptr_type));
-
-        // Exit
-        self.ctx.func.signature.params.push(AbiParam::new(ptr_type));
-
-        // Create a builder for the function
-        let builder = frontend::FunctionBuilder::new(&mut self.ctx.func, &mut self.function_ctx);
+        // We must declare builtins for each individual block.
+        let builtins = Self::declare_builtins(&mut self.jit_module, &mut self.ctx.func);
 
         // A block is a sequence of instructions that are executed in order, until a `JALR` is encountered.
-        let mut block_builder = BlockBuilder::new(builder, ptr_type);
+        let mut block_builder =
+            BlockBuilder::new(&mut self.ctx.func, &mut self.function_ctx, &builtins, ptr_type);
 
         // We keep track of branch points, our strategy is to compile them all.
         let mut branch_points: Vec<(u32, Block)> = Vec::new();
@@ -246,8 +257,9 @@ impl Engine {
 
         #[cfg(test)]
         {
-            // This should be fine even in production but for now test only
-            block_builder.exit_unconstrained(pc);
+            if self.insert_exit {
+                block_builder.exit_unconstrained(pc);
+            }
         }
 
         // Finalize the function
@@ -255,5 +267,37 @@ impl Engine {
         // This can happy by using assembly or something.
         // Ie. I somehow start this jit at some pc that doesnt have a corresponding syscall or JALR out.
         block_builder.builder.finalize();
+    }
+}
+
+impl Engine {
+    // Declares all the builtints and returns thier FuncRef for the given context / func.
+    fn declare_builtins(
+        jit_module: &mut JITModule,
+        building: &mut Function,
+    ) -> BTreeMap<Builtin, FuncRef> {
+        let ptr_type = jit_module.target_config().pointer_type();
+
+        let mut builtins = BTreeMap::new();
+        for builtin in Builtin::all() {
+            let params = builtin.params(ptr_type);
+            let returns = builtin.returns();
+            let _addr = builtin.addr();
+            let name = builtin.name();
+
+            let mut sig = jit_module.make_signature();
+            sig.params = params;
+            sig.returns = returns;
+
+            let func_id = jit_module
+                .declare_function(name, Linkage::Import, &sig)
+                .expect("failed to declare builtin function");
+
+            let func = jit_module.declare_func_in_func(func_id, building);
+
+            builtins.insert(builtin, func);
+        }
+
+        builtins
     }
 }

@@ -1,10 +1,13 @@
-use std::mem::offset_of;
+use std::{collections::BTreeMap, mem::offset_of};
 
-use cranelift::codegen::{
-    self,
-    ir::{condcodes::IntCC, InstBuilder, MemFlags, Type, Value},
-    settings::{self, Configurable},
-    CodegenError,
+use cranelift::{
+    codegen::{
+        self,
+        ir::{condcodes::IntCC, AbiParam, FuncRef, Function, InstBuilder, MemFlags, Type, Value},
+        settings::{self, Configurable},
+        CodegenError,
+    },
+    prelude::FunctionBuilderContext,
 };
 
 use cranelift::frontend;
@@ -15,30 +18,42 @@ use crate::{
     events::MemoryRecord, memory::Memory, Executor, Instruction, Opcode, Program, Register,
 };
 
-use super::{Block, VmContext};
+use super::{Block, Builtin, VmContext};
 
 /// A block of code to be executed.
 pub struct JITBlock {
     // The actual function that will be executed
-    pub func:
-        fn(registers: *mut u32, memory: *mut Memory<MemoryRecord>, pc: *mut u32, exit: *mut u32),
+    pub func: fn(
+        registers: *mut u32,
+        host_memory: *mut Memory<MemoryRecord>,
+        ephemeral_mem: *mut Memory<MemoryRecord>,
+        pc: *mut u32,
+        exit: *mut u32,
+    ),
 }
 
 impl JITBlock {
-    pub unsafe fn call(
-        &self,
-        registers: *mut u32,
-        memory: *mut Memory<MemoryRecord>,
-        pc: *mut u32,
-        exit: *mut u32,
-    ) {
-        (self.func)(registers, memory, pc, exit);
+    pub unsafe fn call(&self, context: &mut VmContext) {
+        let VmContext { registers, host_memory, ephemeral_mem, pc, exit } = context;
+
+        (self.func)(*registers, *host_memory, *ephemeral_mem, pc, exit);
     }
 }
 
+/// A block builder translates risc32 instructions into a cranelift function.
+///
+/// The function has 4 parameters:
+/// - Registers `*mut u32`
+/// - Host Memory `*mut Memory<MemoryRecord>`
+/// - Ephemeral Memory `*mut Memory<MemoryRecord>`
+/// - Pc `*mut u32`
+/// - Exit `*mut u32`
 pub struct BlockBuilder<'b> {
     /// The builder context for the JIT
     pub(super) builder: frontend::FunctionBuilder<'b>,
+
+    /// The builtins that are available to the block
+    builtins: &'b BTreeMap<Builtin, FuncRef>,
 
     /// The native pointer type of the host.
     ptr_type: Type,
@@ -47,7 +62,8 @@ pub struct BlockBuilder<'b> {
     registers_ptr: Value,
     pc_ptr: Value,
     exit_ptr: Value,
-    memory_ptr: Value,
+    host_memory_ptr: Value,
+    ephemeral_mem_ptr: Value,
 
     /// Types that represent the formal types of the ISA
     ///
@@ -61,7 +77,38 @@ pub struct BlockBuilder<'b> {
 
 impl<'b> BlockBuilder<'b> {
     /// Sets up the entry block and gets the context pointer.
-    pub fn new(mut builder: frontend::FunctionBuilder<'b>, ptr_type: Type) -> Self {
+    pub fn new(
+        func: &'b mut Function,
+        ctx: &'b mut FunctionBuilderContext,
+        builtins: &'b BTreeMap<Builtin, FuncRef>,
+        ptr_type: Type,
+    ) -> Self {
+        // First setup the function signature
+        // We know were going to need:
+        // - Registers
+        // - Host Memory
+        // - Ephemeral Memory
+        // - Pc
+        // - Exit
+
+        // Registers
+        func.signature.params.push(AbiParam::new(ptr_type));
+
+        // Host Memory
+        func.signature.params.push(AbiParam::new(ptr_type));
+
+        // Ephemeral Memory
+        func.signature.params.push(AbiParam::new(ptr_type));
+
+        // Pc
+        func.signature.params.push(AbiParam::new(ptr_type));
+
+        // Exit
+        func.signature.params.push(AbiParam::new(ptr_type));
+
+        // Create a builder for the function
+        let mut builder = frontend::FunctionBuilder::new(func, ctx);
+
         // Create the entry block
         let entry_block = builder.create_block();
 
@@ -73,9 +120,10 @@ impl<'b> BlockBuilder<'b> {
         builder.seal_block(entry_block);
 
         let registers = builder.block_params(entry_block)[0];
-        let memory = builder.block_params(entry_block)[1];
-        let pc = builder.block_params(entry_block)[2];
-        let exit = builder.block_params(entry_block)[3];
+        let host_memory = builder.block_params(entry_block)[1];
+        let ephemeral_mem = builder.block_params(entry_block)[2];
+        let pc = builder.block_params(entry_block)[3];
+        let exit = builder.block_params(entry_block)[4];
 
         Self {
             builder,
@@ -85,10 +133,12 @@ impl<'b> BlockBuilder<'b> {
             int_16_type: unsafe { Type::int(16).unwrap_unchecked() },
             int_32_type: unsafe { Type::int(32).unwrap_unchecked() },
             int_64_type: unsafe { Type::int(64).unwrap_unchecked() },
+            builtins,
             exit_ptr: exit,
             registers_ptr: registers,
             pc_ptr: pc,
-            memory_ptr: memory,
+            host_memory_ptr: host_memory,
+            ephemeral_mem_ptr: ephemeral_mem,
         }
     }
 
@@ -137,7 +187,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().iadd(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -147,7 +197,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().isub(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -157,7 +207,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().bxor(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -167,7 +217,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().bor(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -177,7 +227,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().band(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -187,7 +237,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().ishl(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -197,7 +247,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().ushr(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -207,7 +257,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().sshr(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -217,7 +267,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().icmp(IntCC::SignedLessThan, rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -226,7 +276,7 @@ impl<'b> BlockBuilder<'b> {
             Opcode::SLTU => {
                 let result = self.builder.ins().icmp(IntCC::UnsignedLessThan, rs1, rs2);
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -236,7 +286,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().imul(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -246,7 +296,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().smulhi(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -256,7 +306,7 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().umulhi(rs1, rs2);
 
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -274,7 +324,12 @@ impl<'b> BlockBuilder<'b> {
                 let result = self.builder.ins().ireduce(self.int_32_type, high_bits);
 
                 // Store the high 32 bits into rd (as a 32-bit value)
-                self.builder.ins().store(MemFlags::new(), result, self.registers_ptr, rd as i32);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    result,
+                    self.registers_ptr,
+                    rd.register_offset(),
+                );
             }
             Opcode::DIV | Opcode::DIVU | Opcode::REM | Opcode::REMU => {
                 self.translate_branching_alu(instruction.opcode, rd, rs1, rs2);
@@ -289,7 +344,7 @@ impl<'b> BlockBuilder<'b> {
         // Load the syscall id from the registers (5 is the syscall id register)
         let syscall_id = self.builder.ins().load(
             self.int_32_type,
-            MemFlags::new(),
+            MemFlags::trusted(),
             self.registers_ptr,
             Register::X5.register_offset(),
         );
@@ -297,14 +352,14 @@ impl<'b> BlockBuilder<'b> {
         // Load the data registers for the syscall
         let a = self.builder.ins().load(
             self.int_32_type,
-            MemFlags::new(),
+            MemFlags::trusted(),
             self.registers_ptr,
             Register::X10.register_offset(),
         );
 
         let b = self.builder.ins().load(
             self.int_32_type,
-            MemFlags::new(),
+            MemFlags::trusted(),
             self.registers_ptr,
             Register::X11.register_offset(),
         );
@@ -321,14 +376,14 @@ impl<'b> BlockBuilder<'b> {
 
         let rs1_val = self.builder.ins().load(
             self.int_32_type,
-            MemFlags::new(),
+            MemFlags::trusted(),
             self.registers_ptr,
             rs1.register_offset(),
         );
 
         let rs2_val = self.builder.ins().load(
             self.int_32_type,
-            MemFlags::new(),
+            MemFlags::trusted(),
             self.registers_ptr,
             rs2.register_offset(),
         );
@@ -357,7 +412,26 @@ impl<'b> BlockBuilder<'b> {
 
     #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic(), pc = pc))]
     fn translate_load(&mut self, instruction: &Instruction, pc: u32) -> BuilderResult {
-        todo!()
+        let (rd, addr) = self.load_rr(instruction);
+        let word = self.call_load(addr);
+
+        match instruction.opcode {
+            Opcode::LW => {
+                // Store the result into the rd register
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    word,
+                    self.registers_ptr,
+                    rd.register_offset(),
+                );
+            }
+            Opcode::LB => {
+                // Load only the lower byte of the word
+            }
+            _ => unreachable!(),
+        }
+
+        BuilderResult::Continue
     }
 
     #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic(), pc = pc))]
@@ -367,12 +441,13 @@ impl<'b> BlockBuilder<'b> {
 
     #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic(), pc = pc))]
     fn translate_jump(&mut self, instruction: &Instruction, pc: u32) -> BuilderResult {
+        debug_assert!(instruction.is_jump_instruction());
+
         match instruction.opcode {
             Opcode::JALR => {
                 // rd ← pc + 4, pc ← (rs1 + imm) & ∼1
-                let pc_inc = self.constant_32(4_u32);
-                let pc = self.constant_32(pc);
-                let pc_plus_4 = self.builder.ins().iadd(pc, pc_inc);
+                let inc = pc + 4;
+                let pc_plus_4 = self.constant_32(inc);
 
                 let rd = instruction.op_a;
                 let rs1 = instruction.op_b;
@@ -380,12 +455,12 @@ impl<'b> BlockBuilder<'b> {
 
                 // Store the pc + 4 into the rd register.
                 // rd <- pc + 4
-                self.builder.ins().store(MemFlags::new(), pc_plus_4, self.registers_ptr, rd);
+                self.builder.ins().store(MemFlags::trusted(), pc_plus_4, self.registers_ptr, rd);
 
                 // pc <- (rs1 + imm)
                 let v_rs1 = self.builder.ins().load(
                     self.int_32_type,
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     self.registers_ptr,
                     rs1.register_offset(),
                 );
@@ -403,15 +478,14 @@ impl<'b> BlockBuilder<'b> {
             }
             Opcode::JAL => {
                 // rd ← pc + 4, pc ← pc + imm
-                let pc_inc = self.constant_32(4_u32);
-                let v_pc = self.constant_32(pc);
-                let pc_plus_4 = self.builder.ins().iadd(v_pc, pc_inc);
+                let inc = pc + 4;
+                let pc_plus_4 = self.constant_32(inc);
 
                 let rd = instruction.op_a;
 
                 // rd <- pc + 4
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     pc_plus_4,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -436,12 +510,16 @@ impl<'b> BlockBuilder<'b> {
 
         let (rd, imm) = instruction.u_type();
 
-        let pc_inc = self.constant_32(imm);
-        let v_pc = self.constant_32(pc);
-        let pc_plus_imm = self.builder.ins().iadd(v_pc, pc_inc);
+        let pc_plus_imm = pc + imm;
+        let pc_plus_imm = self.constant_32(pc_plus_imm);
 
         // rd <- pc + imm
-        self.builder.ins().store(MemFlags::new(), pc_plus_imm, self.registers_ptr, rd as i32);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            pc_plus_imm,
+            self.registers_ptr,
+            rd.register_offset(),
+        );
 
         BuilderResult::Auipc
     }
@@ -449,6 +527,10 @@ impl<'b> BlockBuilder<'b> {
     /// Translate a branching ALU instruction that checks for 0 divisors.
     #[tracing::instrument(skip_all, fields(opcode = op.mnemonic()))]
     fn translate_branching_alu(&mut self, op: Opcode, rd: u8, rs1: Value, rs2: Value) {
+        debug_assert!(
+            op == Opcode::DIV || op == Opcode::DIVU || op == Opcode::REM || op == Opcode::REMU
+        );
+
         let zero_branch = self.builder.create_block();
         let not_zero_branch = self.builder.create_block();
         let merge_branch = self.builder.create_block();
@@ -466,7 +548,12 @@ impl<'b> BlockBuilder<'b> {
 
         // Were in the zero block, so lets set the result to 0
         let zero = self.constant_32(0_u32);
-        self.builder.ins().store(MemFlags::new(), zero, self.registers_ptr, rd.register_offset());
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            zero,
+            self.registers_ptr,
+            rd.register_offset(),
+        );
         self.builder.ins().jump(merge_branch, &[]);
 
         self.builder.switch_to_block(not_zero_branch);
@@ -476,7 +563,7 @@ impl<'b> BlockBuilder<'b> {
             Opcode::DIV => {
                 let result = self.builder.ins().sdiv(rs1_param, rs2_param);
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -485,7 +572,7 @@ impl<'b> BlockBuilder<'b> {
             Opcode::DIVU => {
                 let result = self.builder.ins().udiv(rs1_param, rs2_param);
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -494,7 +581,7 @@ impl<'b> BlockBuilder<'b> {
             Opcode::REM => {
                 let result = self.builder.ins().srem(rs1_param, rs2_param);
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -503,7 +590,7 @@ impl<'b> BlockBuilder<'b> {
             Opcode::REMU => {
                 let result = self.builder.ins().urem(rs1_param, rs2_param);
                 self.builder.ins().store(
-                    MemFlags::new(),
+                    MemFlags::trusted(),
                     result,
                     self.registers_ptr,
                     rd.register_offset(),
@@ -521,6 +608,8 @@ impl<'b> BlockBuilder<'b> {
 impl<'a> BlockBuilder<'a> {
     #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic()))]
     fn alu_rr(&mut self, instruction: &Instruction) -> (u8, Value, Value) {
+        debug_assert!(instruction.is_alu_instruction());
+
         if !instruction.imm_c {
             let (rd, rs1, rs2) = (instruction.op_a, instruction.op_b, instruction.op_c);
 
@@ -530,14 +619,14 @@ impl<'a> BlockBuilder<'a> {
             // load the rs1 and rs2 values
             let v_rs1 = self.builder.ins().load(
                 self.int_32_type,
-                MemFlags::new(),
+                MemFlags::trusted(),
                 self.registers_ptr,
                 rs1.register_offset(),
             );
 
             let v_rs2 = self.builder.ins().load(
                 self.int_32_type,
-                MemFlags::new(),
+                MemFlags::trusted(),
                 self.registers_ptr,
                 rs2.register_offset(),
             );
@@ -552,7 +641,7 @@ impl<'a> BlockBuilder<'a> {
             // Adding an immediate to a register value.
             let v_rs1 = self.builder.ins().load(
                 self.int_32_type,
-                MemFlags::new(),
+                MemFlags::trusted(),
                 self.registers_ptr,
                 rs1.register_offset(),
             );
@@ -574,9 +663,55 @@ impl<'a> BlockBuilder<'a> {
             (rd, v_imm_1, v_imm_2)
         }
     }
+
+    #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic()))]
+    fn load_rr(&mut self, instruction: &Instruction) -> (Register, Value) {
+        debug_assert!(instruction.is_memory_load_instruction());
+
+        let (rd, rs1, imm) = instruction.i_type();
+
+        let v_rs1 = self.builder.ins().load(
+            self.int_32_type,
+            MemFlags::trusted(),
+            self.registers_ptr,
+            rs1.register_offset(),
+        );
+
+        let addr = self.builder.ins().iadd_imm(v_rs1, imm as i64);
+
+        (rd, self.align_to_word(addr))
+    }
+
+    #[tracing::instrument(skip_all, fields(opcode = instruction.opcode.mnemonic()))]
+    fn store_rr(&mut self, instruction: &Instruction) -> (Value, Value) {
+        debug_assert!(instruction.is_memory_store_instruction());
+
+        // m(rs1 + imm) <- rs2
+        let (rs1, rs2, imm) = instruction.s_type();
+
+        let v_rs1 = self.builder.ins().load(
+            self.int_32_type,
+            MemFlags::trusted(),
+            self.registers_ptr,
+            rs1.register_offset(),
+        );
+
+        let v_word = self.builder.ins().load(
+            self.int_32_type,
+            MemFlags::trusted(),
+            self.registers_ptr,
+            rs2.register_offset(),
+        );
+
+        let addr = self.builder.ins().iadd_imm(v_rs1, imm as i64);
+        let v_addr = self.align_to_word(addr);
+
+        (v_addr, v_word)
+    }
 }
 
 impl<'a> BlockBuilder<'a> {
+    #[tracing::instrument(skip_all, fields(pc = pc))]
     fn handle_syscall(&mut self, pc: u32, syscall_id: Value, a: Value, b: Value) {
         // todo(n)
         // This (incorrectly) assumes were given the the exit syscall..
@@ -586,14 +721,15 @@ impl<'a> BlockBuilder<'a> {
     }
 
     pub(crate) fn set_pc(&mut self, pc: Value) {
-        self.builder.ins().store(MemFlags::new(), pc, self.pc_ptr, 0);
+        self.builder.ins().store(MemFlags::trusted(), pc, self.pc_ptr, 0);
     }
 
+    #[tracing::instrument(skip(self))]
     pub(crate) fn exit_unconstrained(&mut self, pc: u32) {
         let one = self.constant_32(1_u32);
 
         // Set the exit flag to 1
-        self.builder.ins().store(MemFlags::new(), one, self.exit_ptr, 0);
+        self.builder.ins().store(MemFlags::trusted(), one, self.exit_ptr, 0);
 
         let pc = pc + 4;
         let pc_plus_four = self.constant_32(pc);
@@ -603,6 +739,51 @@ impl<'a> BlockBuilder<'a> {
 
         // Also return from the function
         self.builder.ins().return_(&[]);
+    }
+}
+
+impl<'a> BlockBuilder<'a> {
+    fn get_builtin(&self, builtin: Builtin) -> FuncRef {
+        debug_assert!(self.builtins.contains_key(&builtin));
+
+        unsafe { *self.builtins.get(&builtin).unwrap_unchecked() }
+    }
+
+    // Attemps to call a builtin function.
+    // Returns the result of the builtin function.
+    // Assumes that the params are valid.
+    fn call_builtin(&mut self, params: &[Value], builtin: Builtin) -> &[Value] {
+        let func = self.get_builtin(builtin);
+
+        let result = self.builder.ins().call(func, params);
+
+        self.builder.inst_results(result)
+    }
+
+    /// Loads a word from memory
+    /// Assumes that the address is aligned to the word.
+    fn call_load(&mut self, addr: Value) -> Value {
+        let params = vec![self.host_memory_ptr, self.ephemeral_mem_ptr, addr];
+
+        self.call_builtin(&params, Builtin::Load)
+            .first()
+            .copied()
+            .expect("failed to get load result")
+    }
+
+    /// Stores a word into the ephemeral memory.
+    fn call_store(&mut self, addr: Value, data: Value) {
+        let params = vec![self.ephemeral_mem_ptr, addr, data];
+
+        self.call_builtin(&params, Builtin::Store);
+    }
+
+    #[inline]
+    fn align_to_word(&mut self, addr: Value) -> Value {
+        let residue = self.builder.ins().urem_imm(addr, 4);
+        let addr = self.builder.ins().isub(addr, residue);
+
+        addr
     }
 }
 

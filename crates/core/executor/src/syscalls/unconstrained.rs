@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 
-use crate::{state::ForkState, ExecutorMode};
+use crate::{jit::Engine, state::ForkState, ExecutorMode};
 
 use super::{Syscall, SyscallCode, SyscallContext};
 
@@ -8,6 +8,9 @@ pub(crate) struct EnterUnconstrainedSyscall;
 
 impl Syscall for EnterUnconstrainedSyscall {
     fn execute(&self, ctx: &mut SyscallContext, _: SyscallCode, _: u32, _: u32) -> Option<u32> {
+        // let mut engine = Engine::new(ctx.rt.program.pc_base);
+        // engine.run(ctx.rt);
+
         if ctx.rt.unconstrained {
             panic!("Unconstrained block is already active.");
         }
